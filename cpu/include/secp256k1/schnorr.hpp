@@ -29,6 +29,7 @@ struct SchnorrSignature {
     // 64-byte compact encoding: r [32 bytes] concatenated with s [32 bytes]
     std::array<std::uint8_t, 64> to_bytes() const;
     static SchnorrSignature from_bytes(const std::array<std::uint8_t, 64>& data);
+    static SchnorrSignature from_bytes(const std::uint8_t* data64);
 };
 
 // -- Pre-computed Schnorr Keypair ----------------------------------------------
@@ -59,8 +60,17 @@ SchnorrSignature schnorr_sign(const fast::Scalar& private_key,
 // pubkey_x: 32-byte x-only public key
 // msg: 32-byte message
 // sig: 64-byte signature
+bool schnorr_verify(const std::uint8_t* pubkey_x32,
+                    const std::uint8_t* msg32,
+                    const SchnorrSignature& sig);
+
+// Array convenience wrappers
 bool schnorr_verify(const std::array<std::uint8_t, 32>& pubkey_x,
                     const std::array<std::uint8_t, 32>& msg,
+                    const SchnorrSignature& sig);
+
+bool schnorr_verify(const std::array<std::uint8_t, 32>& pubkey_x,
+                    const std::uint8_t* msg32,
                     const SchnorrSignature& sig);
 
 // -- Pre-cached X-only Public Key ---------------------------------------------
@@ -75,6 +85,8 @@ struct SchnorrXonlyPubkey {
 // Parse an x-only pubkey (call once; lift_x + sqrt done here).
 // Returns false if the x-coordinate is not on the curve.
 bool schnorr_xonly_pubkey_parse(SchnorrXonlyPubkey& out,
+                                const std::uint8_t* pubkey_x32);
+bool schnorr_xonly_pubkey_parse(SchnorrXonlyPubkey& out,
                                 const std::array<std::uint8_t, 32>& pubkey_x);
 
 // Create from keypair (no sqrt needed -- point already known).
@@ -83,6 +95,11 @@ SchnorrXonlyPubkey schnorr_xonly_from_keypair(const SchnorrKeypair& kp);
 // Verify using pre-cached pubkey (fast: skips lift_x sqrt).
 bool schnorr_verify(const SchnorrXonlyPubkey& pubkey,
                     const std::array<std::uint8_t, 32>& msg,
+                    const SchnorrSignature& sig);
+
+// Raw-pointer msg overload for pre-cached pubkey.
+bool schnorr_verify(const SchnorrXonlyPubkey& pubkey,
+                    const std::uint8_t* msg32,
                     const SchnorrSignature& sig);
 
 // -- Tagged Hashing (BIP-340) -------------------------------------------------

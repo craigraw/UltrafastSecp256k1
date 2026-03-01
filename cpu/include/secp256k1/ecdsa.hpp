@@ -37,6 +37,7 @@ struct ECDSASignature {
     std::array<std::uint8_t, 64> to_compact() const;
 
     // Decode from compact 64-byte encoding
+    static ECDSASignature from_compact(const std::uint8_t* data64);
     static ECDSASignature from_compact(const std::array<std::uint8_t, 64>& data);
 
     // Normalize to low-S form (BIP-62): if s > n/2, replace with n - s
@@ -57,6 +58,12 @@ ECDSASignature ecdsa_sign(const std::array<std::uint8_t, 32>& msg_hash,
 
 // Verify an ECDSA signature against a public key and message hash.
 // Accepts both low-S and high-S signatures.
+// Raw-pointer overload: avoids 32B array copy when caller has a raw pointer.
+bool ecdsa_verify(const std::uint8_t* msg_hash32,
+                  const fast::Point& public_key,
+                  const ECDSASignature& sig);
+
+// Array overload: thin wrapper.
 bool ecdsa_verify(const std::array<std::uint8_t, 32>& msg_hash,
                   const fast::Point& public_key,
                   const ECDSASignature& sig);

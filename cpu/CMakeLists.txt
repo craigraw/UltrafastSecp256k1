@@ -68,6 +68,9 @@ option(SECP256K1_USE_PGO_GEN "Enable Profile-Guided Optimization - Generate prof
 option(SECP256K1_USE_PGO_USE "Enable Profile-Guided Optimization - Use profile" OFF)
 set(SECP256K1_PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo_profiles" CACHE PATH "Directory for PGO profiles")
 
+# x64 5x52 hand-tuned ASM for field mul/sqr (extern, non-inline, MULX-scheduled)
+option(SECP256K1_USE_ASM52_X64 "Use hand-tuned 5x52 MULX assembly for field mul/sqr (x64)" OFF)
+
 if(SECP256K1_USE_ASM)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|X64" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         # x64 Assembly (Windows/Linux/macOS)
@@ -85,6 +88,15 @@ if(SECP256K1_USE_ASM)
                 COMPILE_FLAGS "${ASM_FLAGS}")
             set(SECP256K1_HAS_ASM TRUE CACHE INTERNAL "Assembly support enabled")
             message(STATUS "Secp256k1: 5x52 using C __int128 (x64, inlines better than external ASM)")
+
+            # Optional: hand-tuned 5x52 MULX assembly for field mul/sqr
+            if(SECP256K1_USE_ASM52_X64)
+                list(APPEND SECP256K1_SOURCES src/field_asm52_x64_gas.S)
+                set_source_files_properties(src/field_asm52_x64_gas.S PROPERTIES
+                    COMPILE_FLAGS "${ASM_FLAGS}")
+                add_compile_definitions(SECP256K1_HAS_X64_FE52_ASM=1)
+                message(STATUS "Secp256k1: 5x52 using hand-tuned MULX assembly (extern, ~8ns field_mul)")
+            endif()
 
             # Enable fast reduction on x64 (uses BMI2/ADX)
             if(SECP256K1_USE_FAST_REDUCTION)
@@ -588,15 +600,18 @@ if(NOT SECP256K1_SANITIZER_BUILD)
             COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fipa-pta -fpredictive-commoning"
         )
         set_source_files_properties(src/point.cpp PROPERTIES 
-            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fipa-pta -fpredictive-commoning"
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fno-exceptions -fno-rtti -fipa-pta -fpredictive-commoning"
         )
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        # Clang: no GCC-specific flags
+        # Clang: no GCC-specific flags.
+        # point.cpp: -fno-exceptions/-fno-rtti removes exception tables and
+        # RTTI metadata, reducing code size.  field.cpp keeps exceptions
+        # (utility functions use throw for validation errors).
         set_source_files_properties(src/field.cpp PROPERTIES 
             COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize"
         )
         set_source_files_properties(src/point.cpp PROPERTIES 
-            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize"
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fno-exceptions -fno-rtti"
         )
     endif()
 endif()
@@ -654,6 +669,10 @@ if(BUILD_TESTING)
     # Field 10x26 vs 4x64 comparison benchmark (32-bit platform target)
     add_executable(bench_field_26 bench/bench_field_26.cpp)
     target_link_libraries(bench_field_26 PRIVATE ${SECP256K1_LIB_NAME})
+
+    # Hornet Node benchmark (Bitcoin consensus full-suite, RDTSC, CT layer)
+    add_executable(bench_hornet bench/bench_hornet.cpp)
+    target_link_libraries(bench_hornet PRIVATE ${SECP256K1_LIB_NAME})
 
     # Comprehensive cross-platform benchmark (all operations for README performance table)
     add_executable(bench_comprehensive bench/bench_comprehensive_riscv.cpp)

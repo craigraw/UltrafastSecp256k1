@@ -74,6 +74,31 @@ extern "C" {
 }
 #endif
 
+// -- x86-64 hand-tuned FE52 kernels (GAS assembly) -----------------------
+// Uses MULX (BMI2) with hand-scheduled register allocation for optimal
+// throughput. The body runs at ~7-8ns but function-call overhead adds ~2ns.
+// Trade-off vs __int128 inline: extern ASM has better instruction scheduling
+// but loses cross-operation ILP that inlining provides.
+//
+// Enabled by CMake when SECP256K1_USE_ASM52_X64=ON sets SECP256K1_HAS_X64_FE52_ASM.
+// To disable and fall back to __int128 C++: -DSECP256K1_USE_ASM52_X64=OFF
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(SECP256K1_HAS_X64_FE52_ASM) \
+    && !defined(SECP256K1_X64_FE52_DISABLE)
+  #define SECP256K1_X64_FE52_ASM 1
+  // The ASM uses System V ABI (rdi, rsi, rdx) even on Windows.
+  #if defined(_WIN32)
+    extern "C" __attribute__((sysv_abi)) void fe52_mul_inner_x64(
+        std::uint64_t* r, const std::uint64_t* a, const std::uint64_t* b);
+    extern "C" __attribute__((sysv_abi)) void fe52_sqr_inner_x64(
+        std::uint64_t* r, const std::uint64_t* a);
+  #else
+    extern "C" {
+        void fe52_mul_inner_x64(std::uint64_t* r, const std::uint64_t* a, const std::uint64_t* b);
+        void fe52_sqr_inner_x64(std::uint64_t* r, const std::uint64_t* a);
+    }
+  #endif
+#endif
+
 // Force-inline attribute -- ensures zero call overhead for field ops.
 // The compiler generates MULX assembly automatically with -mbmi2.
 #if defined(__GNUC__) || defined(__clang__)
@@ -103,9 +128,9 @@ using namespace fe52_constants;
 // With always_inline: zero function-call overhead.
 
 SECP256K1_FE52_FORCE_INLINE
-void fe52_mul_inner(std::uint64_t* __restrict__ r,
-                    const std::uint64_t* __restrict__ a,
-                    const std::uint64_t* __restrict__ b) noexcept {
+void fe52_mul_inner(std::uint64_t* r,
+                    const std::uint64_t* a,
+                    const std::uint64_t* b) noexcept {
 #if defined(SECP256K1_ARM64_FE52_V2)
     // ARM64: hand-scheduled MUL/UMULH interleaving for Cortex-A76 class cores
     arm64_v2::fe52_mul_arm64_v2(r, a, b);
@@ -115,6 +140,10 @@ void fe52_mul_inner(std::uint64_t* __restrict__ r,
     // outperforms __int128 C++ (which Clang compiles to MUL/MULHU pairs
     // with suboptimal register allocation for 25+ multiplications).
     fe52_mul_inner_riscv64(r, a, b);
+#elif defined(SECP256K1_X64_FE52_ASM)
+    // x86-64: Hand-tuned MULX (BMI2) assembly with optimal register scheduling.
+    // ~8ns body vs ~16ns from compiler-generated __int128 code.
+    fe52_mul_inner_x64(r, a, b);
 #else
     using u128 = unsigned __int128;
     u128 c = 0, d = 0;
@@ -196,14 +225,17 @@ void fe52_mul_inner(std::uint64_t* __restrict__ r,
 // Cross-products computed once and doubled via (a[i]*2) trick.
 
 SECP256K1_FE52_FORCE_INLINE
-void fe52_sqr_inner(std::uint64_t* __restrict__ r,
-                    const std::uint64_t* __restrict__ a) noexcept {
+void fe52_sqr_inner(std::uint64_t* r,
+                    const std::uint64_t* a) noexcept {
 #if defined(SECP256K1_ARM64_FE52_V2)
     arm64_v2::fe52_sqr_arm64_v2(r, a);
 #elif defined(SECP256K1_RISCV_FE52_V1)
     // RISC-V: Symmetry-optimized squaring in asm.
     // Cross-products doubled via shift, halving multiplication count.
     fe52_sqr_inner_riscv64(r, a);
+#elif defined(SECP256K1_X64_FE52_ASM)
+    // x86-64: Hand-tuned MULX squaring with symmetry optimization.
+    fe52_sqr_inner_x64(r, a);
 #else
     using u128 = unsigned __int128;
     u128 c = 0, d = 0;
@@ -310,16 +342,12 @@ FieldElement52 FieldElement52::square() const noexcept {
 
 SECP256K1_FE52_FORCE_INLINE
 void FieldElement52::mul_assign(const FieldElement52& rhs) noexcept {
-    std::uint64_t tmp[5];
-    fe52_mul_inner(tmp, n, rhs.n);
-    n[0] = tmp[0]; n[1] = tmp[1]; n[2] = tmp[2]; n[3] = tmp[3]; n[4] = tmp[4];
+    fe52_mul_inner(n, n, rhs.n);
 }
 
 SECP256K1_FE52_FORCE_INLINE
 void FieldElement52::square_inplace() noexcept {
-    std::uint64_t tmp[5];
-    fe52_sqr_inner(tmp, n);
-    n[0] = tmp[0]; n[1] = tmp[1]; n[2] = tmp[2]; n[3] = tmp[3]; n[4] = tmp[4];
+    fe52_sqr_inner(n, n);
 }
 
 // -- Lazy Addition (NO carry propagation!) --------------------------------
@@ -477,6 +505,65 @@ bool FieldElement52::normalizes_to_zero() const noexcept {
     return (t[0] | t[1] | t[2] | t[3] | t[4]) == 0;
 }
 
+// -- Variable-time Zero Check with Early Exit ------------------------------
+// Performs a single normalize_weak pass (carry + overflow reduction + carry),
+// then checks for raw-zero and p.  Avoids the expensive conditional
+// p-subtraction + branchless-select of fe52_normalize_inline.
+//
+// After one normalize_weak pass at any magnitude <= ~4000, the value is
+// in [0, 2p).  The only representations of 0 mod p in [0, 2p) are
+// raw-zero (all limbs 0) and p itself.
+//
+// In the ecmult hot loop, h == 0 occurs with probability ~2^-256,
+// so the fast non-zero path fires in essentially 100% of calls.
+// This replaces the old normalize_weak() + normalizes_to_zero() pair
+// in jac52_add_mixed*, saving ~40 limb ops per mixed add.
+
+SECP256K1_FE52_FORCE_INLINE
+bool FieldElement52::normalizes_to_zero_var() const noexcept {
+    using namespace fe52_constants;
+    std::uint64_t t0 = n[0], t1 = n[1], t2 = n[2], t3 = n[3], t4 = n[4];
+
+    // Pass 1: carry propagation
+    t1 += (t0 >> 52); t0 &= M52;
+    t2 += (t1 >> 52); t1 &= M52;
+    t3 += (t2 >> 52); t2 &= M52;
+    t4 += (t3 >> 52); t3 &= M52;
+
+    // Overflow reduction: fold (t4 >> 48) * R back into t0
+    std::uint64_t x = t4 >> 48;
+    t4 &= M48;
+    t0 += x * 0x1000003D1ULL;
+
+    // Pass 2: propagate injection carry
+    t1 += (t0 >> 52); t0 &= M52;
+    t2 += (t1 >> 52); t1 &= M52;
+    t3 += (t2 >> 52); t2 &= M52;
+    t4 += (t3 >> 52); t3 &= M52;
+
+    // Second overflow reduction (handles magnitude > ~25)
+    x = t4 >> 48;
+    t4 &= M48;
+    if (SECP256K1_UNLIKELY(x != 0)) {
+        t0 += x * 0x1000003D1ULL;
+        t1 += (t0 >> 52); t0 &= M52;
+        t2 += (t1 >> 52); t1 &= M52;
+        t3 += (t2 >> 52); t2 &= M52;
+        t4 += (t3 >> 52); t3 &= M52;
+        t4 &= M48;
+    }
+
+    // Fast path: raw-zero check (fires ~100% of the time for non-zero h)
+    if ((t0 | t1 | t2 | t3 | t4) == 0) return true;
+
+    // Value is in [1, p].  Check if it equals p.
+    // p = {P0, M52, M52, M52, M48}  where P0 = 0xFFFFEFFFFFC2F
+    // Quick exit: if any of t1..t3 != M52, it cannot be p.
+    if ((t1 & t2 & t3) != M52 || t4 != M48) return false;
+
+    return t0 == P0;
+}
+
 // -- Conversion: 4x64 -> 5x52 (inline) -----------------------------------
 
 SECP256K1_FE52_FORCE_INLINE
@@ -541,7 +628,9 @@ FieldElement52 FieldElement52::from_bytes(const std::uint8_t* bytes) noexcept {
         0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
         0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
     };
-    // ge(L, P): check L >= P lexicographically from high limb
+    // ge(L, P): check L >= P lexicographically from high limb.
+    // NOTE: Variable-time comparison -- acceptable because input bytes
+    // are public data (from wire / serialized keys), not secret.
     bool ge_p = true;
     for (int i = 3; i >= 0; --i) {
         if (L[i] < P[i]) { ge_p = false; break; }
