@@ -699,6 +699,15 @@ int main(int argc, char** argv) {
     }, N_SCALAR);
     print_row("scalar_mul (k*P)", scalarmul);
 
+    // scalar_mul_with_plan: fixed K * variable Q (BIP-352 bottleneck)
+    auto kplan = KPlan::from_scalar(privkeys[0], 4);
+    idx = 0;
+    const double plan_mul = bench_ns([&]() {
+        auto r = pubkeys[idx % POOL].scalar_mul_with_plan(kplan);
+        bench::DoNotOptimize(r); ++idx;
+    }, N_SCALAR);
+    print_row("scalar_mul_with_plan", plan_mul);
+
     idx = 0;
     const double dualmul = bench_ns([&]() {
         auto r = Point::dual_scalar_mul_gen_point(
@@ -913,6 +922,74 @@ int main(int argc, char** argv) {
             bench::DoNotOptimize(h); ++idx;
         }, N_FIELD);
         print_row("SHA256 (BIP0340/challenge)", micro_sha256_challenge);
+    }
+
+    // -- tagged_hash vs cached_tagged_hash (fix #1 validation) --
+    {
+        idx = 0;
+        uint8_t th_input[96];
+        std::memcpy(th_input, schnorr_sigs[0].r.data(), 32);
+        std::memcpy(th_input + 32, schnorr_xonly[0].x_bytes.data(), 32);
+        std::memcpy(th_input + 64, msghashes[0].data(), 32);
+
+        const double micro_tagged_hash_slow = bench_ns([&]() {
+            auto h = tagged_hash("BIP0340/challenge", th_input, 96);
+            bench::DoNotOptimize(h);
+        }, N_FIELD);
+        print_row("tagged_hash (recompute tag)", micro_tagged_hash_slow);
+
+        const double micro_tagged_hash_fast = bench_ns([&]() {
+            auto h = detail::cached_tagged_hash(
+                detail::g_challenge_midstate, th_input, 96);
+            bench::DoNotOptimize(h);
+        }, N_FIELD);
+        print_row("cached_tagged_hash (midstate)", micro_tagged_hash_fast);
+
+        printf("| %-44s | %8.2fx  |\n",
+               "  -> midstate speedup",
+               micro_tagged_hash_slow / micro_tagged_hash_fast);
+    }
+
+    // -- lift_x micro-benchmark (fix #2 validation) --
+    {
+        idx = 0;
+        const double micro_lift_x = bench_ns([&]() {
+            // Use the Point class lift_x path through schnorr verify's infrastructure
+            FieldElement px_fe;
+            bool ok = FieldElement::parse_bytes_strict(
+                schnorr_xonly[idx % POOL].x_bytes, px_fe);
+            if (ok) {
+                auto x3 = px_fe.square() * px_fe;
+                auto y2 = x3 + FieldElement::from_uint64(7);
+                auto y = y2.sqrt();
+                bench::DoNotOptimize(y);
+            }
+            ++idx;
+        }, N_POINT);
+        print_row("lift_x (4x64 sqrt)", micro_lift_x);
+
+#if defined(SECP256K1_FAST_52BIT)
+        {
+            using FE52 = fast::FieldElement52;
+            idx = 0;
+            const double micro_lift_x_52 = bench_ns([&]() {
+                FE52 const px52 = FE52::from_bytes(
+                    schnorr_xonly[idx % POOL].x_bytes.data());
+                FE52 const x3 = px52.square() * px52;
+                static const FE52 seven52 = FE52::from_fe(
+                    FieldElement::from_uint64(7));
+                FE52 const y2 = x3 + seven52;
+                FE52 y52 = y2.sqrt();
+                bench::DoNotOptimize(y52);
+                ++idx;
+            }, N_POINT);
+            print_row("lift_x (FE52 sqrt)", micro_lift_x_52);
+
+            printf("| %-44s | %8.2fx  |\n",
+                   "  -> FE52/4x64 speedup",
+                   micro_lift_x / micro_lift_x_52);
+        }
+#endif
     }
 
     // -- FieldElement::parse_bytes_strict (BIP-340 range check) --
@@ -1381,11 +1458,21 @@ int main(int argc, char** argv) {
         (void)ok; ++idx;
     }, N_VERIFY);
 
+    // k*P (arbitrary-point scalar multiply) -- BIP-352 bottleneck
+    idx = 0;
+    const double ls_kP = bench_ns([&]() {
+        secp256k1_pubkey pk_copy = ls_pubkeys[idx % POOL];
+        secp256k1_ec_pubkey_tweak_mul(ls_ctx, &pk_copy,
+                                      ls_seckeys[(idx + 1) % POOL]);
+        bench::DoNotOptimize(pk_copy); ++idx;
+    }, N_SCALAR);
+
     secp256k1_context_destroy(ls_ctx);
 
     print_header("libsecp256k1 (bitcoin-core)");
     print_row("field_inv_var",                    ls_fe_inv);
     print_row("generator_mul (ec_pubkey_create)", ls_gen);
+    print_row("scalar_mul (k*P, tweak_mul)",     ls_kP);
     print_row("ecdsa_sign",                      ls_ecdsa_sign);
     print_row("ecdsa_verify",                    ls_ecdsa_verify);
     print_row("schnorr_keypair_create",          ls_schnorr_kp);
@@ -1530,12 +1617,14 @@ int main(int argc, char** argv) {
     printf("======================================================================\n\n");
 
     print_header_ratio("FAST path (Ultra FAST vs libsecp)");
-    print_ratio("Generator * k",   ls_gen          / keygen);
-    print_ratio("ECDSA Sign",      ls_ecdsa_sign   / u_ecdsa_sign);
-    print_ratio("ECDSA Verify",    ls_ecdsa_verify / u_ecdsa_verify);
-    print_ratio("Schnorr Keypair", ls_schnorr_kp   / u_schnorr_kp);
-    print_ratio("Schnorr Sign",    ls_schnorr_sign / u_schnorr_sign);
-    print_ratio("Schnorr Verify",  ls_schnorr_verify / u_schnorr_verify);
+    print_ratio("Generator * k",        ls_gen            / keygen);
+    print_ratio("Scalar * P (k*P)",     ls_kP             / scalarmul);
+    print_ratio("Scalar * P (KPlan)",   ls_kP             / plan_mul);
+    print_ratio("ECDSA Sign",           ls_ecdsa_sign     / u_ecdsa_sign);
+    print_ratio("ECDSA Verify",         ls_ecdsa_verify   / u_ecdsa_verify);
+    print_ratio("Schnorr Keypair",      ls_schnorr_kp     / u_schnorr_kp);
+    print_ratio("Schnorr Sign",         ls_schnorr_sign   / u_schnorr_sign);
+    print_ratio("Schnorr Verify",       ls_schnorr_verify / u_schnorr_verify);
     print_sep();
     printf("\n");
 
@@ -1610,6 +1699,7 @@ int main(int argc, char** argv) {
     tput("Schnorr sign",              ls_schnorr_sign);
     tput("Schnorr verify",            ls_schnorr_verify);
     tput("generator_mul",             ls_gen);
+    tput("scalar_mul (k*P)",          ls_kP);
     printf("\n");
 #ifdef BENCH_HAS_OPENSSL
     if (ossl_gen > 0.0) {
