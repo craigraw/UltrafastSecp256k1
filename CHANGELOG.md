@@ -5,6 +5,13 @@ All notable changes to UltrafastSecp256k1 are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.1] - 2026-03-08
+
+### Fixed
+
+- **Packaging workflow**: handle immutable GitHub releases by recreating the release
+  with preserved metadata when `gh release upload --clobber` fails (HTTP 422). (#119)
+
 ## [3.20.0] - 2026-03-07
 
 > **Cumulative release: v3.14.0 -> v3.20.0** | 120+ commits | ABI compatible
